@@ -34,6 +34,11 @@ uv run server --log
 
 ## Testing
 
+The active farm strategy is **Extreme Price Reward Farming**. `worker.run_farm`
+now starts its settlement-aware runtime instead of the previous two-outcome
+buy/automatic-liquidation loops. See [strategy configuration and behavior](docs/extreme-price-reward-farming.md).
+
+
 Run the test suite with coverage (the `--cov` flags and the 90% gate are baked
 into `pyproject.toml`'s `addopts`, so a plain `pytest` already enforces them):
 ```

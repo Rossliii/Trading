@@ -3,7 +3,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field
 
-from app.farm.schemas import FarmConfig
+from app.farm.schemas import FarmConfig, RestingOrder
 from app.types import NonNegativeDecimal, OrderSide, PositiveDecimal
 
 # ── Client → server ─────────────────────────────────────────────────────────
@@ -61,6 +61,24 @@ CancelReason = Literal[
     "filled_exit",
     "server_cancelled",
     "guard_pulled",
+    "entry_partial_fill",
+    "entry_timeout",
+    "market_missing",
+    "reward_below_minimum",
+    "reward_inactive_or_unverified",
+    "reward_parameters_changed",
+    "market_expired",
+    "market_excluded",
+    "strategy_halted",
+    "book_missing",
+    "book_one_sided",
+    "reward_depth_insufficient",
+    "midpoint_outside_quotes",
+    "outside_reward_spread",
+    "quote_would_cross",
+    "dynamic_quote_unavailable",
+    "ladder_fill",
+    "lower_buy_stop",
 ]
 
 
@@ -84,6 +102,7 @@ class OrderCancelledEvent(BaseModel):
     outcome: str
     order_id: str
     reason: CancelReason
+    details: dict[str, str | int | float | bool | None] = Field(default_factory=dict)
 
 
 class OrderFilledEvent(BaseModel):
@@ -129,6 +148,8 @@ class FarmPositionEntry(BaseModel):
     yes_shares: Decimal = Decimal(0)
     no_shares: Decimal = Decimal(0)
     unrealized_pnl: Decimal = Decimal(0)
+    position_pnl: Decimal | None = None
+    limit_orders: list[RestingOrder] | None = None
 
 
 class FarmPositionsEvent(BaseModel):

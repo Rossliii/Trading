@@ -23,14 +23,11 @@ from app.api.farm.messages import (
 from app.api.messages import send_event
 from app.bot.balance import get_balance
 from app.bot.cancel import (
-    cancel_all,
-    cancel_all_with_retry,
     cancel_order,
     cancel_order_with_retry,
     cancel_orders,
 )
 from app.bot.execution import build_execution_client
-from app.bot.heartbeat import heartbeat_loop
 from app.bot.orders import get_open_order_ids
 from app.bot.schemas import LimitOrder
 from app.bot.setup import ensure_approval
@@ -50,12 +47,10 @@ from app.constants import (
     POST_FILL_SAMPLE_INTERVAL_SECONDS,
     POST_FILL_SAMPLE_SECONDS,
     SUMMARY_INTERVAL_SECONDS,
-    TICK_INTERVAL_SECONDS,
 )
 from app.db.blacklist import list_blacklist
 from app.db.wallets import Wallet
 from app.exceptions import BlacklistPersistenceError, WalletNotDeployedError
-from app.farm.blacklist_store import load_blacklist, save_blacklist
 from app.farm.discovery import (
     fetch_books,
     fetch_eligible_markets,
@@ -65,7 +60,6 @@ from app.farm.discovery import (
 )
 from app.farm.exit_cost import market_exit_loss
 from app.farm.exits import exit_held_legs, exit_position_leg, reconcile_onchain_positions
-from app.farm.fills import user_ws_loop
 from app.farm.filters import first_failing_filter, passes_all, passes_range_24h
 from app.farm.health import in_guard_pull_cooldown, is_event_excluded, is_paused, mark_paused
 from app.farm.kill_switch import should_kill, trigger_kill, unrealized_loss
@@ -74,11 +68,8 @@ from app.farm.quoting import (
     compute_quote,
     resolve_tier,
     size_per_market,
-    tiers_log_repr,
     two_leg_cost,
 )
-from app.farm.requote import respawn_market_ws
-from app.farm.rewards import rewards_poll_loop
 from app.farm.schemas import (
     FarmConfig,
     FarmState,
@@ -152,6 +143,9 @@ async def annotate_live_metrics(
 def deployed_capital(state: FarmState) -> Decimal:
     total = Decimal(0)
     for pos in state.positions.values():
+        if pos.strategy_capital is not None:
+            total += pos.strategy_capital
+            continue
         size = size_per_market(pos.market)
         total += size * pos.yes_price + size * pos.no_price
     return total
@@ -183,10 +177,22 @@ def build_position_entries(state: FarmState) -> list[FarmPositionEntry]:
                 yes_price=pos.yes_price,
                 no_price=pos.no_price,
                 midpoint=mid,
-                capital_deployed=size * pos.yes_price + size * pos.no_price,
+                capital_deployed=(
+                    pos.strategy_capital
+                    if pos.strategy_capital is not None
+                    else size * pos.yes_price + size * pos.no_price
+                ),
                 yes_shares=pos.yes_shares,
                 no_shares=pos.no_shares,
                 unrealized_pnl=unrealized,
+                position_pnl=(
+                    pos.position_pnl
+                    if pos.strategy_capital is not None
+                    else unrealized
+                    if mid is not None
+                    else None
+                ),
+                limit_orders=pos.resting_orders,
             )
         )
     return entries
@@ -250,145 +256,29 @@ async def run_farm(
     license_key: str,
     farm_session: "FarmSession",
 ) -> None:
-    apply_session_filter_defaults(config)
+    """Run Extreme Price Reward Farming; legacy quote/exit loops are not started."""
+    from app.farm.extreme_worker import run_extreme
+
     try:
         client = build_execution_client(wallet)
+        if client.wallet_type != "DEPOSIT_WALLET":
+            await ensure_approval(wallet.private_key)
+        state = FarmState(config=config, wallet_address=wallet.proxy_address)
+        # Fail closed if exclusions cannot be loaded.
+        for row in await list_blacklist(license_key):
+            state.excluded_markets.add(row.condition_id)
+        farm_session.state = state
+        logger.info("Starting Extreme Price Reward Farming (legacy strategy disabled)")
+        await run_extreme(client, state, websocket, farm_session)
     except WalletNotDeployedError as exc:
-        logger.error(
-            "wallet %s is an undeployed deposit wallet — deploy it on polymarket.com first;"
-            " skipping: %s",
-            wallet.proxy_address,
-            exc,
-        )
         await send_event(
             websocket,
             FarmErrorEvent(reason=f"undeployed deposit wallet {wallet.proxy_address}: {exc}"),
         )
-        return
-    if client.wallet_type != "DEPOSIT_WALLET":
-        await ensure_approval(wallet.private_key)
-    try:
-        await cancel_all(client)
-        logger.info("startup: cleared stale resting orders from any prior session")
-    except Exception:
-        logger.exception("startup cancel_all failed; continuing")
-    state = FarmState(config=config, wallet_address=wallet.proxy_address)
-    logger.info(
-        "farm session start: bankroll=$%s wallet=%s",
-        state.config.bankroll,
-        state.wallet_address,
-    )
-    farm_session.state = state
-    restored = load_blacklist(state)
-    if restored:
-        logger.info("blacklist: restored %d market(s) from a prior session", restored)
-    try:
-        rows = await list_blacklist(license_key)
-        for row in rows:
-            state.excluded_markets.add(row.condition_id)
-        if rows:
-            logger.info("blacklist: loaded %d user-excluded market(s) for this session", len(rows))
     except BlacklistPersistenceError:
-        logger.exception("could not load user blacklist at session start; continuing without it")
-    f = state.config.filters
-    tiers_repr = tiers_log_repr(state.config.size_tiers)
-    strat(
-        "farm_config",
-        bankroll=state.config.bankroll,
-        max_session_loss=state.config.max_session_loss,
-        quote_depth=state.config.quote_depth,
-        size_tiers=tiers_repr,
-        vol_min=f.vol_min,
-        vol_max=f.vol_max,
-        liq_min=f.liq_min,
-        liq_max=f.liq_max,
-        spread_min=f.spread_min,
-        spread_max=f.spread_max,
-        reward_min=f.reward_min,
-        time_remaining=f.time_remaining,
-        created_date=f.created_date,
-        change_24h=f.change_24h,
-        range_24h=f.range_24h,
-        zone_liq_max=f.zone_liq_max,
-        price_min=f.price_min,
-        price_max=f.price_max,
-        max_fill_loss=f.max_fill_loss,
-    )
-
-    try:
-        state.starting_balance = await get_balance(state.wallet_address)
-        logger.info("session starting balance: $%s pUSDC", state.starting_balance)
-        strat("start_balance", balance=state.starting_balance, wallet=state.wallet_address)
-    except Exception:
-        logger.exception("could not fetch starting balance at session start")
-
-    async with httpx.AsyncClient(timeout=30.0) as http:
-        heartbeat = asyncio.create_task(heartbeat_loop(client), name="heartbeat")
-        summary = asyncio.create_task(push_summary_loop(websocket, state), name="summary")
-        user_ws = asyncio.create_task(user_ws_loop(client, state, websocket), name="user_ws")
-        rewards = asyncio.create_task(rewards_poll_loop(client, state), name="rewards")
-        exit_retry = asyncio.create_task(exit_retry_loop(client, state), name="exit_retry")
-        exit_reconcile = asyncio.create_task(
-            exit_reconcile_loop(client, state, http), name="exit_reconcile"
+        await send_event(
+            websocket, FarmErrorEvent(reason="blacklist_unavailable; farm not started")
         )
-        book_sampler = asyncio.create_task(
-            post_fill_sampler_loop(http, state), name="post_fill_sampler"
-        )
-        all_tasks = (heartbeat, summary, user_ws, rewards, exit_retry, exit_reconcile, book_sampler)
-        for task in all_tasks:
-            task.add_done_callback(log_task_exit)
-        await reconcile_startup_positions(client, state, http)
-        market_ws: asyncio.Task | None = None
-        try:
-            while not state.killed:
-                try:
-                    await reconcile_tick(http, client, state, websocket)
-                    market_ws = await respawn_market_ws(market_ws, http, client, state, websocket)
-                except Exception:
-                    logger.exception("reconcile tick failed; will retry next tick")
-                try:
-                    await asyncio.to_thread(save_blacklist, state)
-                except Exception:
-                    logger.exception("blacklist persist failed; will retry next tick")
-                await asyncio.sleep(TICK_INTERVAL_SECONDS)
-            if state.killed:
-                await await_inventory_drained(state)
-        except asyncio.CancelledError:
-            raise
-        finally:
-            farm_session.state = None
-            state.killed = True
-            try:
-                save_blacklist(state)
-            except Exception:
-                logger.exception("blacklist persist on shutdown failed")
-            tasks = [heartbeat, summary, user_ws, rewards, exit_retry, exit_reconcile, book_sampler]
-            if market_ws is not None:
-                tasks.append(market_ws)
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            for cid, pos in state.positions.items():
-                for oid, outcome in ((pos.yes_order_id, "YES"), (pos.no_order_id, "NO")):
-                    if not oid:
-                        continue
-                    try:
-                        await send_event(
-                            websocket,
-                            OrderCancelledEvent(
-                                market_id=cid,
-                                slug=pos.market.slug,
-                                outcome=outcome,
-                                order_id=oid,
-                                reason="shutdown",
-                            ),
-                        )
-                    except Exception:
-                        logger.exception("failed to emit shutdown cancel event for %s", oid)
-            if not await cancel_all_with_retry(client):
-                logger.error(
-                    "cancel_all on shutdown failed after retries — resting orders may remain live"
-                )
 
 
 def has_held_inventory(state: FarmState) -> bool:

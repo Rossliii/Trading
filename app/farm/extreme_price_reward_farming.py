@@ -11,16 +11,17 @@ Prices are dollars (0.045 = 4.5 cents). Reward rate is the MARKET's daily pool,
 not expected personal earnings. Both quotes must remain within the live
 size-adjusted reward spread to score at extreme prices:
 https://docs.polymarket.com/programs/liquidity-rewards
-This module is not wired into the existing farm worker and sends no orders.
+The worker uses this planner through extreme_worker; this module itself sends no orders.
 """
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
+from decimal import ROUND_FLOOR, Decimal
 
 from pydantic import BaseModel, ConfigDict
 
 from app.bot.schemas import LimitOrder
+from app.farm.quoting import compute_inventory_quote
 from app.farm.schemas import Market
 from app.types import PositiveDecimal
 
@@ -33,7 +34,8 @@ class ExtremePriceRewardConfig(BaseModel):
 
     min_reward_per_day: PositiveDecimal  # Caller defines what counts as high reward.
     capital_budget: PositiveDecimal = D("85")  # Entry + pending rebuy, excluding fees.
-    target_shares: PositiveDecimal = D("1000")
+    target_shares: PositiveDecimal = D("1000")  # Legacy input; cash allocation controls size.
+    # Legacy compatibility only; live quotes use fixed tick offsets.
     sell_markup: PositiveDecimal = D("0.003")
     rebuy_discount: PositiveDecimal = D("0.005")
 
@@ -47,10 +49,11 @@ class EntryPlan:
     rebuy_price: Decimal
     shares: Decimal
     minimum_shares: Decimal
+    rebuy_budget: Decimal = D(0)
 
     @property
     def capital_required(self) -> Decimal:
-        return self.shares * (self.entry_price + self.rebuy_price)
+        return self.shares * self.entry_price + self.rebuy_budget
 
     @property
     def entry_order(self) -> LimitOrder:
@@ -72,6 +75,8 @@ def build_entry_plan(
     yes_midpoint: Decimal,
     no_midpoint: Decimal,
     cheap_best_ask: Decimal,
+    cheap_best_bid: Decimal,
+    reward_midpoint: Decimal,
     now: datetime | None = None,
 ) -> EntryPlan | None:
     """Screen one market and budget a cheap-side entry plus one lower rebuy.
@@ -93,23 +98,23 @@ def build_entry_plan(
     else:
         return None
 
-    tick = market.tick_size
-    entry = (cheap_best_ask / tick).to_integral_value(rounding=ROUND_CEILING) * tick
-    sell = ((entry + config.sell_markup) / tick).to_integral_value(
-        rounding=ROUND_CEILING
-    ) * tick
-    rebuy = ((entry - config.rebuy_discount) / tick).to_integral_value(
-        rounding=ROUND_FLOOR
-    ) * tick
-    if not D("0") < rebuy < entry <= D("0.05") or not entry < sell < D("1"):
+    quotes = compute_inventory_quote(cheap_best_bid, cheap_best_ask, market.tick_size)
+    if quotes is None or cheap_best_ask > D("0.05") or not _price(reward_midpoint):
         return None
+    rebuy, sell = quotes
+    spread = market.rewards_max_spread_cents / D(100)
+    # Validate the future reward quotes BEFORE spending any money on entry.
+    if max(abs(rebuy - reward_midpoint), abs(sell - reward_midpoint)) >= spread:
+        return None
+    entry = cheap_best_ask
     minimum = max(market.min_order_size, market.rewards_min_size)
-    # Whole shares deliberately round down; both stages fit within the budget.
-    shares = min(config.target_shares, config.capital_budget / (entry + rebuy))
-    shares = shares.to_integral_value(rounding=ROUND_FLOOR)
-    if shares < minimum:
+    # Split principal equally in dollars, not in shares. The cheaper bid buys more shares.
+    half = config.capital_budget / 2
+    shares = (half / entry).to_integral_value(rounding=ROUND_FLOOR)
+    rebuy_shares = (half / rebuy).to_integral_value(rounding=ROUND_FLOOR)
+    if min(shares, rebuy_shares) < minimum:
         return None
-    return EntryPlan(token, outcome, entry, sell, rebuy, shares, minimum)
+    return EntryPlan(token, outcome, entry, sell, rebuy, shares, minimum, half)
 
 
 def build_quotes(
@@ -131,15 +136,20 @@ def build_quotes(
     if any(not v.is_finite() or v < 0 for v in values) or not _price(reward_midpoint):
         return None
     spread = max_spread_cents / D("100")
-    if not plan.rebuy_price < reward_midpoint < plan.sell_price:
+    if not plan.rebuy_price < plan.sell_price:
         return None
-    if max(plan.sell_price - reward_midpoint, reward_midpoint - plan.rebuy_price) >= spread:
+    if (
+        max(abs(plan.sell_price - reward_midpoint), abs(reward_midpoint - plan.rebuy_price))
+        >= spread
+    ):
         return None
-    size = min(plan.shares, available_shares, available_cash / plan.rebuy_price)
-    size = size.to_integral_value(rounding=ROUND_FLOOR)
-    if size < plan.minimum_shares:
+    sell_size = min(plan.shares, available_shares).to_integral_value(rounding=ROUND_FLOOR)
+    buy_size = (min(plan.rebuy_budget, available_cash) / plan.rebuy_price).to_integral_value(
+        rounding=ROUND_FLOOR
+    )
+    if min(sell_size, buy_size) < plan.minimum_shares:
         return None
     return (
-        _order(plan.token_id, "SELL", plan.sell_price, size),
-        _order(plan.token_id, "BUY", plan.rebuy_price, size),
+        _order(plan.token_id, "SELL", plan.sell_price, sell_size),
+        _order(plan.token_id, "BUY", plan.rebuy_price, buy_size),
     )

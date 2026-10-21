@@ -10,3 +10,5 @@ __pycache__/
 logs/
 state/
 RUN_HISTORY.md
+/Config
+/Config.json

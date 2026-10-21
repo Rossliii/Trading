@@ -21,203 +21,134 @@ def wallet() -> Wallet:
 
 
 def patch_session(monkeypatch, sent):
+    from app.farm import extreme_worker as extreme
+
     mock_client = MagicMock()
     mock_client.wallet_type = "GNOSIS_SAFE"
+    mock_client.cancel_all = AsyncMock()
+    mock_client.get_open_order_ids = AsyncMock(return_value=set())
     monkeypatch.setattr(worker_mod, "build_execution_client", lambda wallet: mock_client)
     monkeypatch.setattr(worker_mod, "ensure_approval", AsyncMock())
-    monkeypatch.setattr(worker_mod, "TICK_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr(worker_mod, "list_blacklist", AsyncMock(return_value=[]))
+    monkeypatch.setattr(extreme, "get_balance", AsyncMock(return_value=100))
 
     async def idle(*args, **kwargs):
         await asyncio.Event().wait()
 
-    for name in ("heartbeat_loop", "push_summary_loop", "user_ws_loop", "rewards_poll_loop"):
-        monkeypatch.setattr(worker_mod, name, idle)
-    monkeypatch.setattr(worker_mod, "respawn_market_ws", AsyncMock(return_value=None))
-    cancel_all_mock = AsyncMock()
-    monkeypatch.setattr(worker_mod, "cancel_all", cancel_all_mock)
-
-    async def fake_cancel_all_with_retry(client):
-        # Shutdown now goes through the retry wrapper — route it through the same recorder so
-        # existing `cancel_all.await_count`/`assert_not_awaited` assertions still hold.
-        await cancel_all_mock(client)
-        return True
-
-    monkeypatch.setattr(worker_mod, "cancel_all_with_retry", fake_cancel_all_with_retry)
-    monkeypatch.setattr(worker_mod, "await_inventory_drained", AsyncMock())
-    monkeypatch.setattr(worker_mod, "save_blacklist", MagicMock())
-    monkeypatch.setattr(worker_mod, "load_blacklist", MagicMock(return_value=0))
-    monkeypatch.setattr(worker_mod, "list_blacklist", AsyncMock(return_value=[]))
+    monkeypatch.setattr(worker_mod, "push_summary_loop", idle)
+    monkeypatch.setattr(extreme, "heartbeat_loop", idle)
+    monkeypatch.setattr(extreme, "rewards_poll_loop", idle)
 
     async def fake_send_event(websocket, event):
         sent.append(event)
 
     monkeypatch.setattr(worker_mod, "send_event", fake_send_event)
+    monkeypatch.setattr(extreme, "send_event", fake_send_event)
+    return mock_client, extreme
 
 
-async def test_run_farm_lifecycle_emits_shutdown_and_cancels(market, farm_state, monkeypatch):
-    sent: list = []
-    patch_session(monkeypatch, sent)
+async def test_run_farm_lifecycle_cancels_and_loads_exclusions(farm_state, monkeypatch):
+    sent = []
+    client, extreme = patch_session(monkeypatch, sent)
     monkeypatch.setattr(
         worker_mod,
         "list_blacklist",
-        AsyncMock(
-            return_value=[
-                BlacklistedMarket(license_key="lic", condition_id="0xexcl-1"),
-                BlacklistedMarket(license_key="lic", condition_id="0xexcl-2"),
-            ]
-        ),
+        AsyncMock(return_value=[BlacklistedMarket(license_key="lic", condition_id="excluded")]),
     )
-
-    pos = farm_state.positions["market-A"]
     session = FarmSession()
-    seen: dict = {}
 
-    async def fake_reconcile(http, client, state, websocket):
-        seen["session_state_is_state"] = session.state is state
-        seen["excluded"] = set(state.excluded_markets)
-        state.positions["market-A"] = pos
-        state.killed = True
+    async def tick(runtime, http):
+        assert session.state is runtime.state
+        assert runtime.state.excluded_markets == {"excluded"}
+        runtime.state.killed = True
 
-    monkeypatch.setattr(worker_mod, "reconcile_tick", fake_reconcile)
-
-    await asyncio.wait_for(
-        worker_mod.run_farm(MagicMock(), farm_state.config, wallet(), "lic", session),
-        timeout=2,
-    )
-
+    monkeypatch.setattr(extreme.ExtremeRuntime, "tick", tick)
+    await worker_mod.run_farm(MagicMock(), farm_state.config, wallet(), "lic", session)
     worker_mod.ensure_approval.assert_awaited_once()
-    assert seen["excluded"] == {"0xexcl-1", "0xexcl-2"}
-    assert seen["session_state_is_state"] is True
     assert session.state is None
-    cancel_events = [e for e in sent if type(e).__name__ == "OrderCancelledEvent"]
-    assert len(cancel_events) == 2
-    assert all(e.reason == "shutdown" for e in cancel_events)
-    assert worker_mod.cancel_all.await_count == 2
-    assert worker_mod.save_blacklist.called
+    assert client.cancel_all.await_count == 2
+    assert client.get_open_order_ids.await_count == 2
 
 
-async def test_run_farm_persists_blacklist_on_manual_stop(market, farm_state, monkeypatch):
-    sent: list = []
-    patch_session(monkeypatch, sent)
-
+async def test_run_farm_manual_stop_cancels_without_liquidating(farm_state, monkeypatch):
+    client, extreme = patch_session(monkeypatch, [])
     in_tick = asyncio.Event()
+    observed = []
 
-    async def block(http, client, state, websocket):
+    async def block(runtime, http):
+        runtime.state.positions.update(farm_state.positions)
+        observed.append(runtime.state)
         in_tick.set()
         await asyncio.Event().wait()
 
-    monkeypatch.setattr(worker_mod, "reconcile_tick", block)
+    monkeypatch.setattr(extreme.ExtremeRuntime, "tick", block)
+    session = FarmSession()
     task = asyncio.create_task(
-        worker_mod.run_farm(MagicMock(), farm_state.config, wallet(), "lic", FarmSession())
+        worker_mod.run_farm(MagicMock(), farm_state.config, wallet(), "lic", session)
     )
-    await asyncio.wait_for(in_tick.wait(), timeout=2)
+    await asyncio.wait_for(in_tick.wait(), 2)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    assert worker_mod.save_blacklist.called, "blacklist must be saved on manual-stop teardown"
+    assert client.cancel_all.await_count == 2
+    assert observed[0].positions["market-A"].yes_shares == 100
+    assert session.state is None
 
 
-async def test_run_farm_survives_blacklist_load_failure(market, farm_state, monkeypatch):
+async def test_run_farm_blacklist_failure_prevents_trading(farm_state, monkeypatch):
     from app.exceptions import BlacklistPersistenceError
 
-    sent: list = []
-    patch_session(monkeypatch, sent)
+    sent = []
+    client, extreme = patch_session(monkeypatch, sent)
     monkeypatch.setattr(
         worker_mod, "list_blacklist", AsyncMock(side_effect=BlacklistPersistenceError())
     )
-
-    seen: dict = {}
-
-    async def fake_reconcile(http, client, state, websocket):
-        seen["excluded"] = set(state.excluded_markets)
-        state.killed = True
-
-    monkeypatch.setattr(worker_mod, "reconcile_tick", fake_reconcile)
-
-    await asyncio.wait_for(
-        worker_mod.run_farm(MagicMock(), farm_state.config, wallet(), "lic", FarmSession()),
-        timeout=2,
-    )
-
-    assert seen["excluded"] == set()
-    assert worker_mod.cancel_all.await_count == 2
+    tick = AsyncMock()
+    monkeypatch.setattr(extreme.ExtremeRuntime, "tick", tick)
+    await worker_mod.run_farm(MagicMock(), farm_state.config, wallet(), "lic", FarmSession())
+    tick.assert_not_awaited()
+    client.cancel_all.assert_not_awaited()
+    assert sent[0].reason == "blacklist_unavailable; farm not started"
 
 
-async def test_run_farm_reconcile_error_is_retried_not_fatal(market, farm_state, monkeypatch):
-    sent: list = []
-    patch_session(monkeypatch, sent)
-
-    calls = {"n": 0}
-
-    async def flaky_reconcile(http, client, state, websocket):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            raise RuntimeError("transient tick failure")
-        state.killed = True
-
-    monkeypatch.setattr(worker_mod, "reconcile_tick", flaky_reconcile)
-
-    await asyncio.wait_for(
-        worker_mod.run_farm(MagicMock(), farm_state.config, wallet(), "lic", FarmSession()),
-        timeout=2,
-    )
-
-    assert calls["n"] == 2
-    assert worker_mod.cancel_all.await_count == 2
+async def test_run_farm_unknown_order_state_stops_instead_of_retrying(farm_state, monkeypatch):
+    sent = []
+    client, extreme = patch_session(monkeypatch, sent)
+    tick = AsyncMock(side_effect=RuntimeError("uncertain submission"))
+    monkeypatch.setattr(extreme.ExtremeRuntime, "tick", tick)
+    await worker_mod.run_farm(MagicMock(), farm_state.config, wallet(), "lic", FarmSession())
+    tick.assert_awaited_once()
+    assert client.cancel_all.await_count == 2
+    assert any("extreme_worker_stopped" in event.reason for event in sent)
 
 
-async def test_run_farm_undeployed_deposit_wallet_skips_cleanly(market, farm_state, monkeypatch):
+async def test_run_farm_undeployed_deposit_wallet_skips_cleanly(farm_state, monkeypatch):
     from app.exceptions import WalletNotDeployedError
 
-    sent: list = []
-    patch_session(monkeypatch, sent)
+    sent = []
+    client, _ = patch_session(monkeypatch, sent)
 
-    def raise_undeployed(w):
-        raise WalletNotDeployedError("proxy not deployed on-chain")
+    def undeployed(wallet):
+        raise WalletNotDeployedError("proxy not deployed")
 
-    monkeypatch.setattr(worker_mod, "build_execution_client", raise_undeployed)
-
-    reconcile_calls = {"n": 0}
-
-    async def fake_reconcile(http, client, state, websocket):
-        reconcile_calls["n"] += 1
-        state.killed = True
-
-    monkeypatch.setattr(worker_mod, "reconcile_tick", fake_reconcile)
-
-    await asyncio.wait_for(
-        worker_mod.run_farm(MagicMock(), farm_state.config, wallet(), "lic", FarmSession()),
-        timeout=2,
-    )
-
-    assert reconcile_calls["n"] == 0
+    monkeypatch.setattr(worker_mod, "build_execution_client", undeployed)
+    await worker_mod.run_farm(MagicMock(), farm_state.config, wallet(), "lic", FarmSession())
     worker_mod.ensure_approval.assert_not_awaited()
-    worker_mod.cancel_all.assert_not_awaited()
-    err_events = [e for e in sent if type(e).__name__ == "FarmErrorEvent"]
-    assert len(err_events) == 1
-    assert wallet().proxy_address in err_events[0].reason
+    client.cancel_all.assert_not_awaited()
+    assert wallet().proxy_address in sent[0].reason
 
 
-async def test_run_farm_deposit_wallet_skips_ensure_approval(market, farm_state, monkeypatch):
-    sent: list = []
-    patch_session(monkeypatch, sent)
+async def test_run_farm_deposit_wallet_skips_ensure_approval(farm_state, monkeypatch):
+    client, extreme = patch_session(monkeypatch, [])
+    client.wallet_type = "DEPOSIT_WALLET"
 
-    deposit_client = MagicMock()
-    deposit_client.wallet_type = "DEPOSIT_WALLET"
-    monkeypatch.setattr(worker_mod, "build_execution_client", lambda w: deposit_client)
+    async def tick(runtime, http):
+        runtime.state.killed = True
 
-    async def fake_reconcile(http, client, state, websocket):
-        state.killed = True
-
-    monkeypatch.setattr(worker_mod, "reconcile_tick", fake_reconcile)
-
-    await asyncio.wait_for(
-        worker_mod.run_farm(MagicMock(), farm_state.config, wallet(), "lic", FarmSession()),
-        timeout=2,
-    )
-
+    monkeypatch.setattr(extreme.ExtremeRuntime, "tick", tick)
+    await worker_mod.run_farm(MagicMock(), farm_state.config, wallet(), "lic", FarmSession())
     worker_mod.ensure_approval.assert_not_awaited()
-    assert worker_mod.cancel_all.await_count == 2
+    assert client.cancel_all.await_count == 2
 
 
 async def test_exit_reconcile_loop_stops_on_closed_client(farm_state, monkeypatch):

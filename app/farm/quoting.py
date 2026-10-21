@@ -124,6 +124,25 @@ def ceil_to_tick(price: Decimal, tick: Decimal) -> Decimal:
     return (price / tick).to_integral_value(rounding=ROUND_CEILING) * tick
 
 
+def compute_inventory_quote(
+    best_bid: Decimal,
+    best_ask: Decimal,
+    tick: Decimal,
+) -> tuple[Decimal, Decimal] | None:
+    """Exact BBA offsets; reject crossed/self-crossing quotes rather than changing the rule."""
+    if not all(value.is_finite() for value in (best_bid, best_ask, tick)):
+        return None
+    if not Decimal(0) < best_bid < best_ask < Decimal(1) or tick <= 0:
+        return None
+    if best_bid % tick or best_ask % tick:
+        return None
+    bid = best_ask - 2 * tick
+    ask = best_bid + tick
+    if not Decimal(0) < bid < ask < Decimal(1) or bid > Decimal("0.05"):
+        return None
+    return bid, ask
+
+
 def floor_to_tick(price: Decimal, tick: Decimal) -> Decimal:
     """Round price DOWN to the nearest valid tick multiple."""
     return (price / tick).to_integral_value(rounding=ROUND_FLOOR) * tick

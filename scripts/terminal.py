@@ -1,4 +1,5 @@
 """Interactive terminal client for the existing WebSocket backend."""
+
 import argparse
 import getpass
 import json
@@ -11,6 +12,7 @@ from websockets.sync.client import connect
 
 from app.api.messages import client_message_adapter
 from app.farm.schemas import FarmConfig, FarmFilters
+from scripts.terminal_tables import positions_table, summary_table
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -81,7 +83,8 @@ def read_config():
 
 def ask_fields(model, supplied=None):
     values = {
-        key: value for key, value in (supplied or {}).items()
+        key: value
+        for key, value in (supplied or {}).items()
         if key in model.model_fields and key != "filters" and value is not None and value != ""
     }
     for name, field in model.model_fields.items():
@@ -102,7 +105,9 @@ def farm_message():
     config = FarmConfig.model_validate(values)
     payload = {"type": "farm_create", **config.model_dump(mode="json")}
     print(json.dumps(payload, indent=2, ensure_ascii=False))
+    print("Strategy: Extreme Price Reward Farming; reward_min is the market's daily reward pool.")
     print("This starts LIVE trading using the first wallet in backend sort order.")
+    print("Stop cancels open orders and retains purchased shares in the wallet.")
     return payload if input("Type START to submit: ").strip() == "START" else None
 
 
@@ -110,7 +115,9 @@ def command_message(line):
     command, _, argument = line.strip().partition(" ")
     argument = argument.strip()
     simple = {
-        "wallets": "wallet_list", "blacklist": "blacklist_list", "stop": "farm_cancel",
+        "wallets": "wallet_list",
+        "blacklist": "blacklist_list",
+        "stop": "farm_cancel",
     }
     if command in simple and not argument:
         return {"type": simple[command]}
@@ -140,7 +147,13 @@ def receive_events(socket, stopped, latest, lock):
             event = json.loads(raw)
             with lock:
                 latest[event.get("type", "event")] = redact(event)
-            print("\n" + json.dumps(redact(event), ensure_ascii=False), flush=True)
+            if event.get("type") == "farm_summary":
+                output = summary_table(event)
+            elif event.get("type") == "farm_positions":
+                output = positions_table(event)
+            else:
+                output = json.dumps(redact(event), ensure_ascii=False)
+            print("\n" + output, flush=True)
     except (ConnectionClosed, OSError, ValueError):
         print("\nConnection ended. Press Enter to return to the terminal.", flush=True)
     finally:
@@ -183,7 +196,8 @@ def run(url):
                 if line == "status":
                     with lock:
                         snapshot = dict(latest)
-                    print(json.dumps(snapshot, indent=2, ensure_ascii=False))
+                    print(summary_table(snapshot.get("farm_summary", {})))
+                    print(positions_table(snapshot.get("farm_positions", {})))
                     continue
                 try:
                     payload = command_message(line)
@@ -221,4 +235,3 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -14,10 +14,12 @@ from py_clob_client_v2.clob_types import (
     OrderArgsV2,
     OrderPayload,
     OrderType,
+    TradeParams,
 )
 
 from app.bot import secure_client as sc
 from app.bot.auth import build_clob_client
+from app.bot.order_snapshot import OrderSnapshot, normalize_snapshot
 from app.bot.schemas import LimitOrder
 from app.db.wallets import Wallet
 from app.exceptions import WalletNotDeployedError
@@ -54,6 +56,10 @@ class ExecutionClient(Protocol):
 
     async def refresh_conditional_balance(self, token_id: str) -> bool: ...
 
+    async def order_snapshot(self, order_id: str) -> OrderSnapshot: ...
+
+    async def conditional_balance(self, token_id: str) -> Decimal: ...
+
 
 class LegacyExecutionClient:
     supports_heartbeat = True
@@ -61,6 +67,25 @@ class LegacyExecutionClient:
     def __init__(self, client: Any, wallet_type: str) -> None:
         self.client = client
         self.wallet_type = wallet_type
+
+    async def order_snapshot(self, order_id: str) -> OrderSnapshot:
+        def read():
+            order = self.client.get_order(order_id)
+            trades = []
+            for tid in order.get("associate_trades") or []:
+                trades.extend(self.client.get_trades(TradeParams(id=tid)))
+            return normalize_snapshot(order, trades)
+
+        return await asyncio.to_thread(read)
+
+    async def conditional_balance(self, token_id: str) -> Decimal:
+        def read():
+            params = BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
+            self.client.update_balance_allowance(params)
+            result = self.client.get_balance_allowance(params)
+            return Decimal(str(result["balance"])) / Decimal(1_000_000)
+
+        return await asyncio.to_thread(read)
 
     async def place_limit_order(self, order: LimitOrder, post_only: bool = False) -> str:
         order_args = OrderArgsV2(
@@ -118,9 +143,7 @@ class LegacyExecutionClient:
 
     async def total_earnings_today(self) -> Decimal:
         date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        result = await asyncio.to_thread(
-            self.client.get_total_earnings_for_user_for_day, date_str
-        )
+        result = await asyncio.to_thread(self.client.get_total_earnings_for_user_for_day, date_str)
         total = Decimal(0)
         for entry in result:
             try:
@@ -169,6 +192,24 @@ class SecureExecutionClient:
         self.client = client
         self.wallet_type = client.wallet_type
 
+    async def order_snapshot(self, order_id: str) -> OrderSnapshot:
+        def read():
+            order = self.client.get_order(order_id=order_id)
+            trades = []
+            for tid in order.associate_trades:
+                trades.extend(
+                    t.model_dump() for t in self.client.list_account_trades(id=tid).iter_items()
+                )
+            return normalize_snapshot(order.model_dump(), trades)
+
+        return await asyncio.to_thread(read)
+
+    async def conditional_balance(self, token_id: str) -> Decimal:
+        result = await asyncio.to_thread(
+            self.client.get_balance_allowance, asset_type="CONDITIONAL", token_id=token_id
+        )
+        return Decimal(result.balance) / Decimal(1_000_000)
+
     async def place_limit_order(self, order: LimitOrder, post_only: bool = False) -> str:
         return await sc.place_limit_order(self.client, order, post_only=post_only)
 
@@ -199,16 +240,12 @@ class SecureExecutionClient:
 
     async def total_earnings_today(self) -> Decimal:
         date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        result = await asyncio.to_thread(
-            self.client.get_total_earnings_for_user_for_day, date=date
-        )
+        result = await asyncio.to_thread(self.client.get_total_earnings_for_user_for_day, date=date)
         return sum((Decimal(str(e.earnings)) for e in result), Decimal(0))
 
     async def market_earnings_today(self) -> dict[str, Decimal]:
         date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        paginator = await asyncio.to_thread(
-            self.client.list_user_earnings_for_day, date=date
-        )
+        paginator = await asyncio.to_thread(self.client.list_user_earnings_for_day, date=date)
         out: dict[str, Decimal] = {}
         for r in paginator.iter_items():
             cid = str(r.condition_id)
@@ -250,9 +287,7 @@ def build_execution_client(wallet: Wallet) -> ExecutionClient:
     Undeployed deposit wallet → raises WalletNotDeployedError.
     """
     if settings.force_legacy_execution:
-        logger.info(
-            "force_legacy_execution: using legacy adapter for %s", wallet.proxy_address
-        )
+        logger.info("force_legacy_execution: using legacy adapter for %s", wallet.proxy_address)
         return LegacyExecutionClient(
             build_clob_client(wallet.private_key, wallet.proxy_address, signature_type=2),
             "GNOSIS_SAFE",

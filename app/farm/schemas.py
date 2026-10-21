@@ -74,6 +74,14 @@ class FarmConfig(BaseModel):
     quote_depth: QuoteDepth = "safe"
     max_concurrent_positions: int = Field(default=MAX_CONCURRENT_POSITIONS, gt=0)
     size_tiers: list[SizeTier] = Field(default_factory=list)
+    extreme_capital_budget: PositiveDecimal = Decimal("85")
+    extreme_target_shares: PositiveDecimal = Field(
+        default=Decimal("1000"), description="Legacy field; sizing now uses a 50/50 cash split."
+    )
+    # Legacy compatibility only; live quotes use fixed tick offsets.
+    extreme_sell_markup: PositiveDecimal = Decimal("0.003")
+    extreme_rebuy_discount: PositiveDecimal = Decimal("0.005")
+    extreme_fee_reserve: NonNegativeDecimal = Decimal("2")
 
 
 class Market(BaseModel):
@@ -121,12 +129,22 @@ class ExitOrder(BaseModel):
     is_floor: bool = False
 
 
+class RestingOrder(BaseModel):
+    outcome: str
+    side: str
+    shares: NonNegativeDecimal
+    value: NonNegativeDecimal
+
+
 class MarketPosition(BaseModel):
     market: Market
     yes_order_id: str
     no_order_id: str
     yes_price: Decimal
     no_price: Decimal
+    strategy_capital: NonNegativeDecimal | None = None
+    resting_orders: list[RestingOrder] | None = None
+    position_pnl: Decimal | None = None
     yes_shares: Decimal = Decimal(0)
     yes_cost_basis: Decimal = Decimal(0)
     no_shares: Decimal = Decimal(0)

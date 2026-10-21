@@ -45,6 +45,17 @@ from app.types import QuoteDepth
 logger = logging.getLogger(__name__)
 
 
+async def watch_quote_changes(token_ids: list[str], wake: asyncio.Event) -> None:
+    """Wake the inventory worker on market updates, without running legacy trading hooks.
+
+    The worker serializes order actions and verifies a fresh REST book before quoting.
+    Event coalescing prevents concurrent cancel/replace operations on the same order.
+    """
+    async for event in stream_market_events(token_ids):
+        if isinstance(event, (BestBidAsk, BookSnapshot, PriceChange, TickSizeChange)):
+            wake.set()
+
+
 async def old_order_is_live(client, old_oid: str) -> bool | None:
     """True if old_oid still rests server-side, False if confirmed gone, None if the poll failed."""
     if not old_oid:
